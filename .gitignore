@@ -1,0 +1,195 @@
+# ============================================================================
+# .gitignore — AllPlatforms
+# ============================================================================
+# Goal: keep every credential, token, personal identifier, and local-only
+# artifact out of version control.
+#
+# This gateway stores account credentials as plaintext JSON on disk, and its
+# config file carries a live API key. All of that MUST stay local.
+#
+# Verified by: `git status --ignored` and a pre-commit secret scan.
+# ============================================================================
+
+
+# ---------------------------------------------------------------------------
+# 1. Credentials and secrets  (HIGHEST PRIORITY)
+# ---------------------------------------------------------------------------
+# Account credential stores — plaintext tokens, refresh tokens, account IDs.
+auths/
+traeauths/
+**/auths/
+**/traeauths/
+
+# Live configuration — contains the real api_key.
+# Commit config.example.json instead.
+config.json
+**/config.json
+!config.example.json
+
+# Key material and environment files.
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+.env
+.env.*
+*.env
+secrets/
+.credentials/
+**/credentials/
+
+# Token / session dumps.
+*.token
+*token*.json
+*session*.json
+*credential*.json
+*secret*.json
+login.json
+
+# Anything that looks like a dump of auth state.
+*.auth
+*.cred
+
+
+# ---------------------------------------------------------------------------
+# 2. Runtime state  (contains account identifiers and usage history)
+# ---------------------------------------------------------------------------
+data/
+**/data/
+
+# PID files and lock files.
+*.pid
+*.lock
+.pid
+**/.run.pid
+
+
+# ---------------------------------------------------------------------------
+# 3. Release packages and build output
+# ---------------------------------------------------------------------------
+# Release directories bundle a built binary PLUS credential files.
+release/
+release-*/
+release-test/
+**/release/
+**/release-*/
+**/release-test/
+
+# Build output.
+dist/
+**/dist/
+target/
+build/
+out/
+
+# Compiled binaries (anchored to repo root; bare "login"/"credit" would also
+# match the cmd/login and cmd/credit source directories).
+/allplatforms
+/allplatforms.exe
+/login
+/login.exe
+/credit
+/credit.exe
+/signin_bin
+/wb2api
+/wb2api.exe
+server.exe
+*.exe
+!cmd/**/*.go
+
+
+# ---------------------------------------------------------------------------
+# 4. Logs and diagnostics
+# ---------------------------------------------------------------------------
+*.log
+**/*.log
+logs/
+*.log.*
+*.jsonl
+data/request-logs/
+crash-*.txt
+
+
+# ---------------------------------------------------------------------------
+# 5. Local archives / backups  (often contain credentials)
+# ---------------------------------------------------------------------------
+.archive/
+backups/
+*.bak
+*.backup
+*.old
+*.orig
+*.trash
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.frozen-*
+.tmp-*
+.tmp*/
+
+
+# ---------------------------------------------------------------------------
+# 6. Personal / local-only documents
+# ---------------------------------------------------------------------------
+# Requirement notes and local planning docs may embed local paths or
+# personal identifiers.
+项目需求_all.txt
+LOOP.md
+PLAN.md
+SPEC.md
+TODO.md
+NOTES.md
+docs/
+
+# Markdown is ignored by default to avoid leaking local notes;
+# README.md is explicitly re-included below.
+*.md
+!README.md
+!LICENSE
+
+# Source-embedded resources must be committed — they are compiled into the
+# binary via go:embed, so excluding them breaks the build.
+!internal/platform/workbuddy/prompt/*.md
+!internal/platform/trae/prompt/*.md
+
+
+# ---------------------------------------------------------------------------
+# 7. Editor / IDE / OS noise
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+
+# ---------------------------------------------------------------------------
+# 8. Language toolchain caches
+# ---------------------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+node_modules/
+
+
+# ---------------------------------------------------------------------------
+# 9. Local verification helpers
+# ---------------------------------------------------------------------------
+/cmd/desktopverify*/
+
+
+# ---------------------------------------------------------------------------
+# 10. CI workflows
+# ---------------------------------------------------------------------------
+# Upstream CI configs were removed: the push token lacks the `workflow` scope
+# and these files targeted the pre-merge layout (produced a `wb2api` binary).
+# Keep them out so they cannot be re-added by accident.
+.github/workflows/
