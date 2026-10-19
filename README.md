@@ -1,7 +1,8 @@
 # AllPlatforms — Unified Multi-Platform AI Gateway
 
-<!-- Name:Shaw -->
-<!-- Email: 2536990321@qq.com -->
+## Name:Shaw 
+
+## Email: 2536990321@qq.com
 
 A single-binary Go gateway that exposes multiple AI platforms (WorkBuddy /
 CodeBuddy, Trae SOLO) behind one OpenAI-compatible API, on one port, with a
