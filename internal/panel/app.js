@@ -408,6 +408,12 @@ function renderAccounts(list) {
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
+    // refreshToken 失效告警（2026-10-23）：与普通 reason 分开显示 —— 它要求
+    // 用户**重新登录**，而非等待冷却。accessToken 到期后该账号会彻底不可用。
+    const deadAlert = s.session_dead_alert
+      ? '<div class="hint" style="font-size:11.5px;color:#c0392b;font-weight:600;margin-top:3px">'
+        + '⚠ refreshToken 已失效，需重新登录</div>'
+      : '';
     const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
@@ -443,7 +449,7 @@ function renderAccounts(list) {
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
-      '<td>' + tag + note + rateLimits + '</td>' +
+      '<td>' + tag + deadAlert + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
@@ -3272,7 +3278,15 @@ function traeScoreModels(list) {
 /* 状态标签：与 Trae 视图用同一套色标，扫表时不用重新学一遍。 */
 function allStatusTag(a) {
   const cls = { ok: 'ok', cooling: 'warn', disabled: 'bad', paused: '' }[a.status] || '';
+  // refreshToken 失效告警（2026-10-23）：这是「根凭证已死、但 accessToken 可能
+  // 还有效」的预警，必须与普通 reason 分开显示 —— 它要求用户**重新登录**，
+  // 而不是等待冷却结束。若不显式提示，用户会在 accessToken 到期后突然遇到 503。
+  const alert = a.session_dead_alert
+    ? '<div class="hint" style="font-size:11.5px;color:#c0392b;font-weight:600;margin-top:3px">'
+      + '⚠ refreshToken 已失效，需重新登录（accessToken 到期后将无法使用）</div>'
+    : '';
   return '<span class="tag ' + cls + '">' + esc(a.label || a.status) + '</span>'
+    + alert
     + (a.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(a.reason) + '</div>' : '');
 }
 

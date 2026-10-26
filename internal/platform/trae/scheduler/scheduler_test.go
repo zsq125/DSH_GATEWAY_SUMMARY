@@ -43,6 +43,9 @@ type fakeUp struct {
 	claimSeqIdx    int
 	entBody        string
 	exchangeOK     bool
+	// exchangeDead=true 模拟凭证失效（401 / ErrSessionDead），
+	// 用于验证保活抽象层的「立即告警」路径（2026-10-24 新增）。
+	exchangeDead bool
 }
 
 func newFakeUp(t *testing.T) *fakeUp {
@@ -83,9 +86,12 @@ func newFakeUp(t *testing.T) *fakeUp {
 	})
 	mux.HandleFunc(upstream.EpExchange, func(w http.ResponseWriter, r *http.Request) {
 		f.nExchange.Add(1)
-		if !f.exchangeOK {
+		// exchangeDead：模拟凭证失效（401 → upstream 分类为 ErrSessionDead）。
+		// 与 exchangeOK=false 的区别：两者都返回 401，但 exchangeDead 用于
+		// 明确表达「这是终态失效」的测试意图（保活应告警而非静默失败）。
+		if f.exchangeDead || !f.exchangeOK {
 			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"error":"invalid"}`))
+			_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"Result":{"Token":"NEW","RefreshToken":"NEWRT","TokenExpireAt":1786847930141}}`))

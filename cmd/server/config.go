@@ -16,6 +16,19 @@ import (
 	"allplatforms/internal/platform/workbuddy/prompt"
 )
 
+// 保活自动化在**配置层**的默认值（2026-10-23）。
+//
+// 为什么在配置层再定义一份、而不直接依赖调度器默认：
+// 配置层的「空字符串」必须解析成一个**具体 Duration** 才能传给调度器，
+// 而调度器层的 0 是「禁用」语义。两者混用会让「没写配置」变成「静默禁用」
+// （实测踩过：config 里没有 keepalive_interval 键 → 间隔循环根本没启动）。
+//
+// 数值与 scheduler.defaultKeepalive* 保持一致；有测试钉住两者相等。
+const (
+	defaultKeepaliveIntervalCfg     = 4 * time.Hour
+	defaultKeepaliveVerifyWithinCfg = 7 * 24 * time.Hour
+)
+
 // Config 顶层配置。
 type Config struct {
 	Listen    string `json:"listen"`     // ":7863"
@@ -71,6 +84,28 @@ type Config struct {
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
 		BlackcatHours  []int `json:"blackcat_hours"`  // [23] 夜猫子窗口（23:00–08:00 计数）
 		GrowthHours    []int `json:"growth_hours"`    // [1] 成长任务队列（Sequential 族每日零点解锁，01:00 自动扫描执行）
+
+		// ── 保活自动化（2026-10-23 新增，四层防护）──────────────────────
+		//
+		// 事故背景：refreshToken 被上游作废后，因 accessToken 仍有效，
+		// 对话照常成功 → 用户完全无感；直到 accessToken 也失效才突然 503。
+		// 原设计保活每天只跑 1 次（22:00），最长 24 小时才发现账号已死。
+		//
+		// 以下四个参数把这件事自动化，无需人工干预：
+		//
+		//	keepalive_interval       Layer 1：固定间隔循环（默认 "4h"）
+		//	keepalive_retry          Layer 3：非确定性失败重试（默认 [30,120,600] 秒）
+		//	keepalive_verify_within  Layer 4：提前验证窗口（默认 "168h" = 7 天）
+		//	（Layer 2 的即时告警不需要配置，12153 一律立即写入账号状态）
+		//
+		// 全部可留空回落默认；显式 "0"/"0s" 可关闭对应行为。
+		KeepaliveInterval string `json:"keepalive_interval"` // 默认 "4h"；"0"=关闭间隔循环
+		// KeepaliveRetry 重试间隔（秒）。空=默认 [30,120,600]；[]=不重试。
+		// 只对非确定性失败重试；12153（refreshToken 真失效）不重试。
+		KeepaliveRetry []int `json:"keepalive_retry"`
+		// KeepaliveVerifyWithin accessToken 剩余寿命小于该值时保活主动刷新。
+		// 默认 "168h"（7 天）：保证 refreshToken 至少每周被验证一次。
+		KeepaliveVerifyWithin string `json:"keepalive_verify_within"`
 		// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/BlackcatEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -249,6 +284,12 @@ type Config struct {
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
 	ExpiringSoonDur        time.Duration `json:"-"`
+	// KeepaliveIntervalDur 解析后的保活固定间隔（Layer 1）；0 = 不启动间隔循环。
+	KeepaliveIntervalDur time.Duration `json:"-"`
+	// KeepaliveRetryDurs 解析后的保活重试间隔（Layer 3）；空 = 不重试。
+	KeepaliveRetryDurs []time.Duration `json:"-"`
+	// KeepaliveVerifyWithinDur 解析后的提前验证窗口（Layer 4）；0 = 用调度器默认。
+	KeepaliveVerifyWithinDur time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
@@ -706,6 +747,46 @@ func (c *Config) normalize() error {
 	if c.ExpiringSoonDur < 0 {
 		c.ExpiringSoonDur = 0
 		c.Pool.ExpiringSoon = "0"
+	}
+
+	// ── 保活自动化（四层防护，2026-10-23）────────────────────────────
+	//
+	// 三个参数都是「空 = 回落默认」，与既有 soft_rate / expiring_soon 的处理风格一致：
+	// 老 config 没有这些键 → 零值 → 用默认值（间隔 4h / 重试 [30,120,600] / 验证 7 天），
+	// 即老配置**自动获得新行为**，无需改文件。显式写 "0" 可关闭。
+	//
+	// keepalive_interval：空 = 用默认 4h；"0" = 关闭间隔循环（只剩整点排程，回到旧行为）。
+	//
+	// ⚠ 语义分层（易踩）：配置层的「空」= 用默认，必须解析成**具体值**再传给调度器；
+	// 调度器层的「0」= 禁用。若把空值解析成 0 传下去，间隔循环会被静默关掉
+	// （实测踩过：配置没写该键 → 循环没启动，日志里看不到「保活间隔循环已启动」）。
+	if c.Schedule.KeepaliveInterval == "" {
+		c.KeepaliveIntervalDur = defaultKeepaliveIntervalCfg
+	} else if c.KeepaliveIntervalDur, err = time.ParseDuration(c.Schedule.KeepaliveInterval); err != nil {
+		return fmt.Errorf("schedule.keepalive_interval: %w", err)
+	}
+	if c.KeepaliveIntervalDur < 0 {
+		c.KeepaliveIntervalDur = 0
+		c.Schedule.KeepaliveInterval = "0"
+	}
+	// keepalive_retry：nil = 默认序列；空数组 [] = 不重试（显式关闭）。
+	if c.Schedule.KeepaliveRetry != nil {
+		for i, sec := range c.Schedule.KeepaliveRetry {
+			if sec < 0 {
+				return fmt.Errorf("schedule.keepalive_retry[%d]: 不能为负", i)
+			}
+			c.KeepaliveRetryDurs = append(c.KeepaliveRetryDurs, time.Duration(sec)*time.Second)
+		}
+	}
+	// keepalive_verify_within：空 = 默认 7 天；"0" = 不提前验证（只按 RefreshSkew）。
+	if c.Schedule.KeepaliveVerifyWithin == "" {
+		c.KeepaliveVerifyWithinDur = defaultKeepaliveVerifyWithinCfg
+	} else if c.KeepaliveVerifyWithinDur, err = time.ParseDuration(c.Schedule.KeepaliveVerifyWithin); err != nil {
+		return fmt.Errorf("schedule.keepalive_verify_within: %w", err)
+	}
+	if c.KeepaliveVerifyWithinDur < 0 {
+		c.KeepaliveVerifyWithinDur = 0
+		c.Schedule.KeepaliveVerifyWithin = "0"
 	}
 	// costTier 探索窗口（issue #136）：空值回落默认 30m（Default 已置；此兜底覆盖
 	// 显式 ""）；"0" 是合法值（关停，完全回到现状行为），不回落；负值钳 0 同关停

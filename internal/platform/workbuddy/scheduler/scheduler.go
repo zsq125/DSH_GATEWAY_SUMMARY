@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,6 +32,55 @@ type Config struct {
 	BlackcatHours  []int // 默认 [23]：夜猫子（23:00–08:00 计数窗口）
 	GrowthHours    []int // 默认 [1]：成长任务队列（Sequential 族每日零点解锁一环，
 	// 01:00 自动扫描+执行；避开零点整防解锁竞态）
+
+	// KeepaliveInterval 保活**间隔**（非整点）。>0 时启用「固定间隔循环」，
+	// 与 KeepaliveHours（整点排程）**并行运行**，两者互不排斥。
+	//
+	// ── 为什么需要它（2026-10-23 事故）────────────────────────────────
+	//
+	// 原设计只有整点排程（每天 22:00 一次）。实测事故链：
+	//
+	//	10-22 14:00  refreshToken 被上游作废（此时无人知晓）
+	//	10-22 22:00  保活运行 → 刷新失败 → 只写一行日志
+	//	10-23 00:07  accessToken 仍可用，对话照常成功（用户无感）
+	//	10-23 11:58  accessToken 也失效 → 突然 503（用户才发现）
+	//
+	// 即：refreshToken 死了之后，系统最长要 **24 小时**才发现，
+	// 而期间 accessToken 还能用，形成「静默失效窗口」。
+	//
+	// 固定间隔循环把发现窗口从 24 小时压到 KeepaliveInterval（默认 4h）。
+	//
+	// 取 4h 而非更短：刷新是真实上游调用（每次 rotate refreshToken），
+	// 过密会增加上游调用量与风控面。4h 对「30 天有效期的 accessToken」
+	// 完全够用，且一天只多 5 次刷新。
+	KeepaliveInterval time.Duration
+
+	// KeepaliveRetry 保活失败的重试间隔序列（秒）。空=不重试。
+	//
+	// 只对**非确定性**失败重试（网络抖动 / 上游瞬时故障）；
+	// `12153`（refreshToken 真失效）与「响应缺 accessToken」是确定性失败，不重试。
+	// 默认 [30, 120, 600]：30 秒 → 2 分钟 → 10 分钟，覆盖绝大多数瞬时故障。
+	//
+	// ⚠ 重试是**串行阻塞**的（保活循环里逐号处理）。为避免「所有号都瞬时失败
+	// 时把一轮保活拖成 N×12 分钟」，实际等待受 KeepaliveRetryBudget 约束。
+	KeepaliveRetry []time.Duration
+
+	// KeepaliveRetryBudget 单轮保活的总重试时间预算。默认 90 秒。
+	//
+	// 为什么需要：重试间隔合计 12.5 分钟，若某轮多个账号同时瞬时失败，
+	// 串行重试会让这轮保活迟迟不结束（手动触发时面板请求也会挂住）。
+	// 预算耗尽后不再重试，剩余账号走「非终态失败」路径（下一轮循环再试）。
+	//
+	// 90 秒 ≈ 覆盖前两档（30s + 2min 中的前 60s），足以扛过绝大多数抖动；
+	// 真正的长故障交给下一轮间隔循环（4h 后），而不是在这里死等。
+	KeepaliveRetryBudget time.Duration
+
+	// KeepaliveVerifyWithin 提前验证 refreshToken 的有效性窗口。
+	//
+	// accessToken 剩余寿命小于该值时，保活会主动刷新（相当于把
+	// RefreshSkew 的语义扩展到保活侧）。默认 168h（7 天）：
+	// 保证「即使 refreshToken 中途失效，也至少每周被验证一次」。
+	KeepaliveVerifyWithin time.Duration
 
 	// ExpiringSoonWindow 快过期积分窗口：签到/余额刷新查余额时，把到期时间
 	// <= now+window 的套餐余额标记为"快过期"（pool 据此做最早到期优先，见
@@ -101,6 +151,18 @@ type Scheduler struct {
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
+
+	// runCtx 进程级 ctx（由 Run 记录），供保活重试的可中断等待使用。
+	// 未启动 Run 时（单测直接调 RunKeepaliveNow）为 nil → ctxOf 返回 Background。
+	runCtx atomic.Pointer[context.Context]
+}
+
+// ctxOf 返回进程级 ctx；未启动时为 context.Background()（永不取消）。
+func (s *Scheduler) ctxOf() context.Context {
+	if p := s.runCtx.Load(); p != nil && *p != nil {
+		return *p
+	}
+	return context.Background()
 }
 
 // New 构建。
@@ -123,12 +185,48 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.VisionHours) == 0 {
 		cfg.VisionHours = []int{3} // 03:00 视觉探测（避开签到/成长高峰）
 	}
+	// 保活间隔与重试的默认值（0 表示未配置）。
+	//
+	// 默认 4h 间隔：把「refreshToken 静默失效」的发现窗口从 24h 压到 4h。
+	// 默认重试 [30s, 2min, 10min]：救回瞬时抖动，但不碰确定性失败（12153）。
+	// 默认 7 天验证窗口：即使 token 还剩很久，也每周主动验证一次 refreshToken。
+	if cfg.KeepaliveInterval < 0 {
+		cfg.KeepaliveInterval = 0 // 负数视为禁用（显式）
+	}
+	if cfg.KeepaliveInterval == 0 {
+		cfg.KeepaliveInterval = defaultKeepaliveInterval
+	}
+	if len(cfg.KeepaliveRetry) == 0 {
+		cfg.KeepaliveRetry = defaultKeepaliveRetry
+	}
+	if cfg.KeepaliveRetryBudget <= 0 {
+		cfg.KeepaliveRetryBudget = defaultKeepaliveRetryBudget
+	}
+	if cfg.KeepaliveVerifyWithin <= 0 {
+		cfg.KeepaliveVerifyWithin = defaultKeepaliveVerifyWithin
+	}
 	return &Scheduler{
 		cfg:           cfg,
 		adoptTried:    make(map[string]string),
 		rearmSchedule: make(chan struct{}, 1),
 		rearmBalance:  make(chan struct{}, 1),
 	}
+}
+
+// 保活自动化的默认参数（见 Config.Keepalive* 的注释）。
+const (
+	defaultKeepaliveInterval     = 4 * time.Hour
+	defaultKeepaliveVerifyWithin = 7 * 24 * time.Hour
+	// defaultKeepaliveRetryBudget 单轮保活的重试总预算。
+	// 90 秒 ≈ 前两档（30s、2min）的大部分，够扛瞬时抖动，又不至于让
+	// 「多账号同时失败」把一轮保活拖到十几分钟。
+	defaultKeepaliveRetryBudget = 90 * time.Second
+)
+
+var defaultKeepaliveRetry = []time.Duration{
+	30 * time.Second,
+	2 * time.Minute,
+	10 * time.Minute,
 }
 
 // ExpiringSoonWindow 返回当前快过期路由窗口（读取时与热配置写在 schedMu 下同步）。
@@ -443,6 +541,8 @@ func (s *Scheduler) waitSlot(ctx context.Context, next time.Time, step time.Dura
 // Run 主循环，阻塞直到 ctx 取消。
 // Reconfigure 触发 rearmSchedule 时提前唤醒重算（新时点/开关立即生效）。
 func (s *Scheduler) Run(ctx context.Context) {
+	// 记录进程级 ctx：保活重试的等待据此可中断（关停时不被 12 分钟重试拖住）。
+	s.runCtx.Store(&ctx)
 	for {
 		next, kinds := s.nextWake(time.Now())
 		if next.IsZero() {
@@ -674,7 +774,36 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 // 12153 禁用走 Pool.NoteSessionDead 的**连续计数**语义：一次刷新失败不再立即杀号，
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
+//
+// ── 2026-10-23 增强（四层防护）────────────────────────────────────────
+//
+// 事故背景：refreshToken 被上游作废后，因为 accessToken 仍在有效期内，
+// 对话照常成功 → 用户完全无感；直到 accessToken 也失效才突然 503。
+// 期间最长 24 小时（等下一次整点保活）系统完全不知道账号已死。
+//
+// 本函数现在的行为：
+//  1. **重试**（Layer 3）：非确定性失败（网络抖动/上游瞬时故障）按
+//     cfg.KeepaliveRetry 重试；`12153` 是确定性失败，不重试。
+//  2. **提前验证**（Layer 4）：即使 accessToken 还剩很久，只要剩余寿命
+//     小于 cfg.KeepaliveVerifyWithin（默认 7 天）就主动刷新 —— 保证
+//     refreshToken 至少每周被验证一次，不会「静默死掉」。
+//  3. **立即告警**（Layer 2）：12153 立即写入账号状态（reason + 错误时间），
+//     面板可见，而不是只写一行日志。
+//
+// 频次由 cfg.KeepaliveInterval 的独立循环提供（Layer 1，见 StartKeepaliveLoop）。
 func (s *Scheduler) RunKeepaliveNow() {
+	s.runKeepalive(true)
+}
+
+// runKeepalive 保活主体。force=true 时不做「剩余寿命」预筛（整点排程语义：
+// 无条件刷新所有账号，与改动前逐字一致）；force=false 时只刷「剩余寿命 <
+// KeepaliveVerifyWithin」的账号（间隔循环语义：省上游调用，只做有效性验证）。
+//
+// 为什么区分：整点排程（每天 22:00）是「日常保号」，必须无条件刷新——
+// 它同时承担「把闲置号 token 续期」的职责（include_disabled_in_tasks 场景），
+// 若加预筛会让「剩余 20 天」的闲置号永远不被续期，反而更容易死。
+// 间隔循环（每 4h）是「失效探测」，按需刷新才合理，否则一天白打 6 次上游。
+func (s *Scheduler) runKeepalive(force bool) {
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
@@ -684,21 +813,142 @@ func (s *Scheduler) RunKeepaliveNow() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
-		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+		// Layer 4（仅间隔循环）：提前验证 —— 剩余寿命不足 VerifyWithin 才刷。
+		// NeedsRefresh(within) 语义是「剩余寿命 < within」，覆盖「7 天内到期」与「已过期」。
+		if !force && !a.NeedsRefresh(s.cfg.KeepaliveVerifyWithin) {
+			continue
+		}
+
+		err := s.refreshWithRetry(a) // Layer 3
+		if err != nil {
 			var ue *upstream.Error
-			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
-				if s.cfg.Pool.NoteSessionDead(st.UID) {
-					log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
+			isDead := errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead
+			if isDead {
+				// Layer 2：立即告警 —— 写进 pool 状态，面板立刻可见。
+				// 不等 3 次计数：refreshToken 失效是**终态**，掩盖它只会让
+				// accessToken 到期时突然暴雷（本次事故正是如此）。
+				s.cfg.Pool.MarkSessionDeadAlert(st.UID, err.Error())
+				log.Printf("ALERT: keepalive %s: refreshToken 已失效（12153），需重新登录；"+
+					"accessToken 到期后将无法使用: %v", logfmt.Label(st.UID, st.Nickname), err)
+				if !st.Disabled && s.cfg.Pool.NoteSessionDead(st.UID) {
+					log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用",
+						logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
 				}
+			} else {
+				// 非确定性失败（重试已耗尽）：记错误但不禁用 —— 下次循环还会再试。
+				log.Printf("keepalive %s: 刷新失败（已重试 %d 次，非终态，下轮再试）: %v",
+					logfmt.Label(st.UID, st.Nickname), len(s.cfg.KeepaliveRetry), err)
 			}
 			continue
 		}
 		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
+		s.cfg.Pool.ClearSessionDeadAlert(st.UID)
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("keepalive %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
 		}
 	}
+}
+
+// refreshWithRetry 带重试的 token 刷新（Layer 3）。
+//
+// 只重试**非确定性**失败：网络抖动、5xx、超时这类重试有意义；
+// 以下情况**不重试**（确定性失败，重试只是白打上游调用）：
+//   - `12153`（refreshToken 真失效）
+//   - 响应格式不符（如缺 accessToken）—— 换多少次结果都一样
+//
+// 重试间隔取 cfg.KeepaliveRetry（默认 30s / 2min / 10min）。总耗时上限
+// 约 12 分钟，期间该账号的在途名额不受影响（保活不占在途名额）。
+//
+// 可中断：sleep 期间若 s.ctx 被取消（进程关闭 / 测试清理），立即放弃重试，
+// 避免「关停时被重试拖住」以及「测试里无法收尾」。
+func (s *Scheduler) refreshWithRetry(a *auth.Auth) error {
+	err := s.cfg.Upstream.RefreshToken(a)
+	if err == nil {
+		return nil
+	}
+	if !isRetriableRefreshErr(err) {
+		return err // 确定性失败，不重试
+	}
+	ctx := s.ctxOf()
+	// 总预算：避免「多账号同时瞬时失败」把一轮保活拖成 N×12 分钟。
+	deadline := time.Now().Add(s.cfg.KeepaliveRetryBudget)
+	for _, d := range s.cfg.KeepaliveRetry {
+		// 预算耗尽 → 放弃重试（剩余账号交给下一轮间隔循环）。
+		if time.Now().Add(d).After(deadline) {
+			return err
+		}
+		// 可中断的等待：ctx 取消 → 立即放弃（不拖住关停/测试）。
+		if !sleepCtx(ctx, d) {
+			return err
+		}
+		rerr := s.cfg.Upstream.RefreshToken(a)
+		if rerr == nil {
+			log.Printf("keepalive %s: 重试 %v 后刷新成功", logfmt.Label(a.UID, a.Nickname), d)
+			return nil
+		}
+		err = rerr
+		if !isRetriableRefreshErr(rerr) {
+			return rerr // 重试途中发现确定性失败，立即停
+		}
+	}
+	return err
+}
+
+// isRetriableRefreshErr 判断刷新失败是否值得重试。
+//
+// 确定性失败（不重试）：
+//   - ErrSessionDead（12153）：refreshToken 已失效，重试无意义
+//   - 响应格式不符（"no accessToken in response"）：上游行为固定，换多少次都一样
+//
+// 其余（网络错误、超时、5xx、429）视为瞬时故障，重试有意义。
+func isRetriableRefreshErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ue *upstream.Error
+	if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+		return false
+	}
+	// 响应缺字段是确定性失败：RefreshToken 对该形态返回固定文案。
+	// 用子串判断而非错误类型，因为它是 fmt.Errorf 构造的普通错误。
+	if strings.Contains(err.Error(), "no accessToken in response") {
+		return false
+	}
+	return true
+}
+
+// StartKeepaliveLoop 固定间隔保活循环（Layer 1）。
+//
+// 与整点排程（KeepaliveHours）**并行运行**：整点排程保留兼容，
+// 本循环负责把「refreshToken 静默失效」的发现窗口从 24 小时压到 interval。
+//
+// interval <= 0 时不启动（等价于关闭该循环）。
+// 每次触发复用 RunKeepaliveNow（已含重试/提前验证/告警）。
+func (s *Scheduler) StartKeepaliveLoop(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	go func() {
+		// 启动后先等一个完整间隔再首次执行：避免与「进程刚启动时的整点排程」
+		// 重复刷新（启动时若恰好临近整点，两者会撞在一起）。
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if s.cfg.KeepaliveDisabled {
+					continue
+				}
+				// force=false：间隔循环只刷「剩余寿命 < VerifyWithin」的账号，
+				// 避免一天白打 6 次上游；整点排程仍走 force=true 的无条件刷新。
+				s.runKeepalive(false)
+			}
+		}
+	}()
+	log.Printf("scheduler: 保活间隔循环已启动，每 %v 检查一次（把静默失效窗口从 24h 压到 %v）",
+		interval, interval)
 }
 
 // RunBalanceRefreshNow 并发查询余额并更新池内 credits。

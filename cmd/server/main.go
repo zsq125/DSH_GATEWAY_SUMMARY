@@ -193,6 +193,12 @@ func main() {
 		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
+		// 保活自动化（四层防护，2026-10-23）。零值回落调度器默认：
+		// 间隔 4h / 重试 [30s,2min,10min] / 验证窗口 7 天。
+		// 这几个参数把「refreshToken 静默失效」的发现窗口从 24h 压到 4h。
+		KeepaliveInterval:     cfg.KeepaliveIntervalDur,
+		KeepaliveRetry:        cfg.KeepaliveRetryDurs,
+		KeepaliveVerifyWithin: cfg.KeepaliveVerifyWithinDur,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -389,6 +395,10 @@ func main() {
 	// 见上方「多平台注册」段落前的声明）。
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
+	// 保活固定间隔循环（Layer 1，2026-10-23）：与整点排程并行，把
+	// 「refreshToken 静默失效」的发现窗口从 24h 压到 cfg.KeepaliveIntervalDur（默认 4h）。
+	// 0 = 不启动（保持旧行为，只剩整点排程）。
+	sch.StartKeepaliveLoop(ctx, cfg.KeepaliveIntervalDur)
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
 	// 填充（两者均懒触发），重启后到首次 /v1/models 或面板模型页被访问之前，

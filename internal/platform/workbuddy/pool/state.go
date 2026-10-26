@@ -55,6 +55,69 @@ func (p *Pool) ClearSessionDead(uid string) {
 	}
 }
 
+// MarkSessionDeadAlert 标记「refreshToken 已失效」的**即时告警**（不立即禁用）。
+//
+// ── 与 NoteSessionDead 的区别 ────────────────────────────────────────
+//
+//	NoteSessionDead  : 连续计数，达 3 次才 Disable（防瞬时抖动误杀）
+//	MarkSessionDeadAlert: **立即**把失效事实写进账号状态，面板可见
+//
+// 为什么两者都要：
+//
+//	本次事故（2026-10-23）的核心问题是**不可见** —— refreshToken 在
+//	10-22 14:00 就被作废，保活 22:00 刷新失败只写了一行日志，而 accessToken
+//	仍能用，用户完全无感；直到 10-23 11:58 accessToken 也失效才突然 503。
+//
+// 所以「已经确认失效」这件事必须**立刻可见**，而不是等 3 次计数凑满。
+// 这里写入 reason + lastErr，面板就能显示「需重新登录」，让用户在
+// accessToken 到期**之前**就有机会处理。
+//
+// 注意：**不改 disabled**。禁用仍走 NoteSessionDead 的 3 次语义，
+// 避免把「瞬时 12153」误判成终态（P0-1 教训：13 个 disabled 号全是误杀）。
+func (p *Pool) MarkSessionDeadAlert(uid, msg string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	e.sessionDeadAlert = true
+	e.sessionDeadMsg = truncateAlert(msg)
+	// 只更新错误时间戳（entry 没有独立的错误消息字段；失效详情在 sessionDeadMsg）。
+	e.lastErr = time.Now()
+	p.dirty.Store(true)
+}
+
+// ClearSessionDeadAlert 清告警 —— 任何证明账号仍可用的时刻调用：
+// 刷新成功（保活）、对话成功（NoteSuccess）、手工复活（Revive/ReviveDisabled）。
+func (p *Pool) ClearSessionDeadAlert(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok && e.sessionDeadAlert {
+		e.sessionDeadAlert = false
+		e.sessionDeadMsg = ""
+		p.dirty.Store(true)
+	}
+}
+
+// clearSessionDeadAlertLocked 锁内版本（供已有锁的调用点复用，避免重入死锁）。
+func clearSessionDeadAlertLocked(e *entry) {
+	if e.sessionDeadAlert {
+		e.sessionDeadAlert = false
+		e.sessionDeadMsg = ""
+	}
+}
+
+// truncateAlert 限制告警信息长度（上游 401 页是整段 HTML，存原样会撑爆 state.json）。
+func truncateAlert(s string) string {
+	const max = 200
+	s = strings.Join(strings.Fields(s), " ") // 折叠空白（HTML 错误页有多行）
+	if len(s) > max {
+		return s[:max] + "…"
+	}
+	return s
+}
+
 // ReviveDisabled 人工/端点复活入口：清除 disabled + reason + 连续 12153 计数，
 // 账号回到池子（若无其他冷却/熔断则立即可选，健康检查自然接管）。
 // **不改** Disabled 在选号/状态端点的既有语义：disabled 号依然不参与选号，
@@ -66,6 +129,9 @@ func (p *Pool) ReviveDisabled(uid string) {
 		e.disabled = false
 		e.reason = ""
 		e.sessionDeadFails = 0
+		// 手工复活即视为「人工确认可用」：清告警，否则面板会一直显示
+		// 「需重新登录」，与实际状态矛盾（实测踩到：复活后告警残留）。
+		clearSessionDeadAlertLocked(e)
 		p.dirty.Store(true)
 	}
 }
@@ -89,6 +155,8 @@ func (p *Pool) Revive(uid string) bool {
 	e.softStreak = 0
 	e.modelCooldowns = nil // 模型级限流豁免随冷却一并清（防泄漏到后续账号级限流）
 	e.sessionDeadFails = 0
+	// 解冻是全清：告警一并清除（同 ReviveDisabled 的理由）。
+	clearSessionDeadAlertLocked(e)
 	e.fails = 0
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
@@ -181,6 +249,9 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.breakerUntil = time.Time{}
 		e.softStreak = 0
 		e.sessionDeadFails = 0
+		// 对话成功 = token 确实有效 → 清失效告警。
+		// 否则会出现「账号明明在用、面板却提示需重新登录」的矛盾状态。
+		clearSessionDeadAlertLocked(e)
 		e.consecutiveFails = 0
 		e.degradeUntil = time.Time{}
 		p.dirty.Store(true)
@@ -566,6 +637,8 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		LastErrTime:              e.lastErr,
 		Until:                    e.until,
 		SoftStreak:               e.softStreak,
+		SessionDeadAlert:         e.sessionDeadAlert,
+		SessionDeadMsg:           e.sessionDeadMsg,
 		ModelCosts:               p.modelCostsStatusLocked(e, now),
 		ConsecutiveFails:         e.consecutiveFails,
 		DegradeUntil:             e.degradeUntil,

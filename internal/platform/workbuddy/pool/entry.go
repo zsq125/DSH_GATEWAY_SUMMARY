@@ -113,6 +113,15 @@ type Status struct {
 	// 误以为"没记录"，实际是零值被 omitempty 省略）。
 	ConsecutiveFails int       `json:"consecutive_fails"`
 	DegradeUntil     time.Time `json:"degrade_until,omitempty"` // 连败降权截止（非零且未过 = 降权中）
+	// SessionDeadAlert 保活已确认 refreshToken 失效（12153），面板应提示「需重新登录」。
+	//
+	// 与 Disabled 的区别：Disabled 是「已出池、不再参与选号」的终态；
+	// SessionDeadAlert 是「根凭证已死、但 accessToken 可能还有效」的**预警**。
+	// 2026-10-23 事故：refreshToken 10-22 14:00 就死了，但 accessToken 还能用，
+	// 用户完全无感，直到 10-23 11:58 accessToken 也失效才突然 503。
+	// 这个字段让「已确认失效」立刻可见，而不是等 3 次计数凑满才禁用。
+	SessionDeadAlert bool   `json:"session_dead_alert"`
+	SessionDeadMsg   string `json:"session_dead_msg,omitempty"`
 	// 运行态（不持久化）：在途请求数 + 熔断器状态。
 	InFlight     int       `json:"in_flight"`
 	BreakerFails int       `json:"breaker_fails"`
@@ -235,6 +244,22 @@ type entry struct {
 	// 重学（再吃 2 次失败才禁用，期间每次都白打一轮上游）；清零点（refresh/chat 成功、
 	// 手工复活）同样落盘，重启后不残留旧计数。
 	sessionDeadFails int
+
+	// sessionDeadAlert refreshToken **已确认失效**的即时告警标记（不等 3 次计数）。
+	//
+	// 为什么与 sessionDeadFails 并存：
+	//   sessionDeadFails 走「连续 3 次才 Disable」的防误杀语义；
+	//   但「已确认 12153」这个**事实**必须立刻可见 —— 否则 refreshToken 死了
+	//   而 accessToken 还能用，用户完全无感，直到 accessToken 到期突然全挂
+	//   （2026-10-23 事故正是如此，静默 22 小时）。
+	//
+	// 语义：true = 保活已确认该账号 refreshToken 失效，面板应提示「需重新登录」。
+	// 清除：刷新成功（ClearSessionDeadAlert）或手工复活。
+	// 不影响 disabled —— 禁用仍由 sessionDeadFails 的 3 次阈值决定。
+	sessionDeadAlert bool
+	// sessionDeadMsg 告警详情（上游原文，已折叠空白并截断）。
+	sessionDeadMsg string
+
 	// consecutiveFails 连续失败计数（连败降权，issue #114）——「不知道原因的兜底」：
 	// 覆盖 ErrClient（未知 4xx）与传输层失败（连不上上游）这类 applyErrorPolicy
 	// default 分支不罚号的形态。与 sessionDeadFails 同构但独立计数：12153 的终态
@@ -442,6 +467,14 @@ type stateAccount struct {
 	// SessionDeadFails 连续 12153 计数（判定 session 死亡的进度）。持久化以保留
 	// 「重启后连续计数继续累计」。
 	SessionDeadFails int `json:"session_dead_fails"`
+	// SessionDeadAlert 保活已确认 refreshToken 失效（12153），面板应提示「需重新登录」。
+	//
+	// 与 Disabled 的区别：Disabled 是「已出池、不再参与选号」的终态；
+	// SessionDeadAlert 是「根凭证已死、但 accessToken 可能还有效」的**预警**。
+	// 后者让用户在 accessToken 到期前就有机会处理，而不是等突然 503。
+	SessionDeadAlert bool `json:"session_dead_alert"`
+	// SessionDeadMsg 失效详情（上游原文，已折叠空白并截断到 200 字符）。
+	SessionDeadMsg string `json:"session_dead_msg,omitempty"`
 	// ConsecutiveFails 连续失败计数（连败降权进度，见 entry.consecutiveFails）。
 	ConsecutiveFails int `json:"consecutive_fails"`
 	// DegradeUntil 连败降权截止（issue #114）。仅未过期才持久化（落盘/恢复均惰性

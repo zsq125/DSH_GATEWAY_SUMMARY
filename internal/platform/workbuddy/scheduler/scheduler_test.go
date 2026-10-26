@@ -203,6 +203,13 @@ type fakeUpstream struct {
 	travelCalls    atomic.Int32
 	resourceRemain int64
 	resourceEnd    string
+
+	// 保活自动化测试用的失败注入（2026-10-23）。
+	// refreshSessionDead=true → 刷新返回 12153（确定性失败，不该重试）
+	// refreshFailTimes>0     → 前 N 次刷新返回 refreshFailStatus（模拟瞬时故障）
+	refreshSessionDead bool
+	refreshFailTimes   int32
+	refreshFailStatus  int
 }
 
 func (f *fakeUpstream) server() *httptest.Server {
@@ -222,6 +229,22 @@ func (f *fakeUpstream) server() *httptest.Server {
 				jsonI64(f.resourceRemain) + `,"CycleCapacityUsed":0` + end + `}]}}}}`))
 		case strings.HasSuffix(r.URL.Path, "/token/refresh"):
 			f.refreshCalls.Add(1)
+			// 失败注入（保活自动化测试）：12153 与瞬时 5xx 两种形态。
+			if f.refreshSessionDead {
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"code":12153,"msg":"12153:refresh token is invalid"}`))
+				return
+			}
+			if f.refreshFailTimes > 0 {
+				f.refreshFailTimes--
+				code := f.refreshFailStatus
+				if code == 0 {
+					code = http.StatusInternalServerError
+				}
+				w.WriteHeader(code)
+				w.Write([]byte(`{"code":500,"msg":"transient upstream failure"}`))
+				return
+			}
 			w.Write([]byte(`{"code":0,"data":{"accessToken":"new","expiresIn":3600}}`))
 		case strings.HasSuffix(r.URL.Path, "/activity/growth/buddy/info"):
 			// 已领养（data.buddy 非空）：跳过领养前置，直接进旅行状态查询。

@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"allplatforms/internal/platform/trae/auth"
@@ -53,6 +54,28 @@ type Config struct {
 	RefreshSkew       time.Duration
 	BalanceEnabled    bool
 	BalanceInterval   time.Duration
+
+	// ── 保活自动化（2026-10-24，四层防护，与 WorkBuddy 同构）──────────
+	//
+	// 背景：排查发现 Trae 的保活与 WorkBuddy 有完全相同的三个缺陷 ——
+	// 只有整点排程（静默失效最长 24h 才发现）、失败只写日志（面板不可见）、
+	// 401 直接 Disable（一次就永久禁用，比 WorkBuddy 更粗暴）。
+	//
+	// 以下参数把通用保活编排（internal/platform/keepalive）接进来：
+	//
+	//	KeepaliveInterval       Layer 1：固定间隔循环（默认 4h）
+	//	KeepaliveRetry          Layer 3：瞬时失败重试（默认 [30s,2min,10min]）
+	//	KeepaliveRetryBudget    Layer 3：单轮重试总预算（默认 90s）
+	//	KeepaliveVerifyWithin   Layer 4：提前验证窗口（默认 7 天）
+	//
+	// 零值全部回落 keepalive 包的默认值；显式负 Interval 关闭循环。
+	KeepaliveInterval     time.Duration
+	KeepaliveRetry        []time.Duration
+	KeepaliveRetryBudget  time.Duration
+	KeepaliveVerifyWithin time.Duration
+
+	// IncludeDisabledInTasks 保活/余额是否覆盖已禁用账号（默认 false）。
+	IncludeDisabledInTasks bool
 }
 
 // Scheduler 定时调度器。
@@ -62,6 +85,16 @@ type Scheduler struct {
 	// guard 批量任务级互斥（见 guard.go）：防止多个触发源并发跑同一任务，
 	// 那会让账号自己踩自己（9074 是全局闸门）。
 	guard *taskGuard
+	// runCtx 进程级 ctx（Run 记录），供保活重试的可中断等待使用。
+	runCtx atomic.Pointer[context.Context]
+}
+
+// ctxOf 返回进程级 ctx；未启动 Run 时为 context.Background()（永不取消）。
+func (s *Scheduler) ctxOf() context.Context {
+	if p := s.runCtx.Load(); p != nil && *p != nil {
+		return *p
+	}
+	return context.Background()
 }
 
 // New 构建调度器。
@@ -111,6 +144,13 @@ func (s *Scheduler) Reconfigure(checkin, keepalive []int, checkinDisabled, keepa
 
 // Run 阻塞式主循环；ctx 取消即退出。全部任务关闭时不空转。
 func (s *Scheduler) Run(ctx context.Context) {
+	// 记录进程级 ctx：保活重试的等待据此可中断（关停时不被预算拖住）。
+	s.runCtx.Store(&ctx)
+	// 固定间隔保活循环（Layer 1，2026-10-24）：与整点排程并行，
+	// 把「refreshToken 静默失效」的发现窗口从 24h 压到 KeepaliveInterval（默认 4h）。
+	if !s.cfg.KeepaliveDisabled {
+		go s.newKeepaliveRunner().StartLoop(ctx, s.buildSubjects)
+	}
 	if s.cfg.CheckinDisabled && s.cfg.KeepaliveDisabled {
 		log.Printf("[scheduler] 签到与保活均已禁用，等待退出信号")
 		<-ctx.Done()
@@ -458,6 +498,30 @@ func (s *Scheduler) KeepaliveAll(now time.Time) Summary {
 	}
 	defer s.guard.Release(taskNameKeepalive)
 
+	// 2026-10-24：改走通用保活抽象层（internal/platform/keepalive）。
+	//
+	// force=false：**保留 Trae 原有的窗口语义** —— 只在 token 剩余寿命小于
+	// KeepaliveVerifyWithin 时才刷新。
+	//
+	// 为什么不用 force=true：Trae 的既有语义是「按 RefreshSkew 窗口决定是否
+	// 换 token」（TestKeepaliveSkipsFreshToken 钉住了这一点：剩余 100 小时
+	// 的 token 不该被换）。若无条件强制刷新，会：
+	//   - 把闲置号的 token 无谓轮换（每次刷新都是真实上游调用）
+	//   - 破坏既有测试约定
+	//   - 增加风控面
+	//
+	// 抽象层补齐的仍是 Trae 原本缺失的三件事：
+	//   - 瞬时失败重试（原先一次失败就放弃，等下一轮整点）
+	//   - 凭证失效立即告警（原先只 log，面板不可见）
+	//   - 重试预算（防止多账号同时失败时把一轮拖成十几分钟）
+	return s.runKeepaliveViaRunner(false)
+}
+
+// keepaliveAllLegacy 旧的保活实现，保留以便对照/回滚。
+//
+// 已由 KeepaliveAll 的抽象层版本取代（见 keepalive_adapter.go）。
+// 保留原因：出问题时能快速对照原行为；确认新实现稳定后可删除。
+func (s *Scheduler) keepaliveAllLegacy(now time.Time) Summary {
 	var sum Summary
 	for _, st := range s.cfg.Pool.List() {
 		sum.Total++

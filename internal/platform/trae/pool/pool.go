@@ -53,6 +53,15 @@ type Status struct {
 	Enabled   bool   `json:"enabled"`
 	Note      string `json:"note,omitempty"`
 
+	// SessionDeadAlert 保活已确认 refreshToken 失效，面板应提示「需重新登录」。
+	//
+	// 与 Disabled 的区别：Disabled 是「已出池」的终态；本字段是
+	// 「根凭证已死、但 accessToken 可能还有效」的**预警** —— 让用户在
+	// accessToken 到期前就有机会重新登录，而不是突然遇到失败
+	//（WorkBuddy 侧 2026-10-23 事故正是静默失效 22 小时）。
+	SessionDeadAlert bool   `json:"session_dead_alert"`
+	SessionDeadMsg   string `json:"session_dead_msg,omitempty"`
+
 	ExpiresAt  string `json:"expires_at,omitempty"`  // token 过期时刻
 	SharedWith int    `json:"shared_with,omitempty"` // 共同管理账号数
 
@@ -89,6 +98,12 @@ type entry struct {
 	enabled  bool
 	reason   string
 	until    time.Time
+
+	// sessionDeadAlert 保活已确认 refreshToken 失效的预警标记（不持久化）。
+	// 与 disabled 的区别：这是「需重新登录」的提示，账号仍可能可用
+	//（accessToken 未到期），不禁用、不参与选号排除。
+	sessionDeadAlert bool
+	sessionDeadMsg   string
 
 	inFlight     int
 	lastUsed     time.Time
@@ -330,6 +345,11 @@ func (p *Pool) SetEnabled(uid string, enabled bool, reason string) bool {
 	if enabled && e.reason != "" && !e.disabled && e.until.IsZero() {
 		e.reason = ""
 	}
+	// 重新启用即视为「人工确认可用」：清失效告警，否则面板会一直显示
+	// 「需重新登录」，与实际状态矛盾。
+	if enabled {
+		clearSessionDeadAlertLocked(e)
+	}
 	p.saveLocked()
 	return true
 }
@@ -508,6 +528,60 @@ func (p *Pool) Disable(uid, reason string) {
 	p.saveLocked()
 }
 
+// MarkSessionDeadAlert 标记「refreshToken 已确认失效」的即时告警（不立即禁用）。
+//
+// 与 Disable 的区别：
+//
+//	Disable：账号出池，不再参与选号（终态）
+//	本方法：只标记「需重新登录」的预警，账号仍按原状态运作
+//
+// 为什么需要：Trae 的 401 在 handler.go 里直接 Disable（一次就永久禁用），
+// 但 refreshToken 失效时 accessToken 往往还有效 —— 直接禁用会让用户在
+// 还有可用额度时突然失去账号。本方法让「已失效」这个事实**立刻可见**，
+// 用户可在 accessToken 到期前重新登录，而不是突然遇到失败。
+func (p *Pool) MarkSessionDeadAlert(uid, msg string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	e.sessionDeadAlert = true
+	e.sessionDeadMsg = truncateAlert(msg)
+	e.lastErr = time.Now()
+	e.lastErrMsg = "refreshToken 已失效，需重新登录"
+	p.saveLocked()
+}
+
+// ClearSessionDeadAlert 清告警 —— 刷新成功 / 对话成功 / 手工复活时调用。
+func (p *Pool) ClearSessionDeadAlert(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok && e.sessionDeadAlert {
+		e.sessionDeadAlert = false
+		e.sessionDeadMsg = ""
+		p.saveLocked()
+	}
+}
+
+// clearSessionDeadAlertLocked 锁内版本（供已有锁的调用点复用，避免重入死锁）。
+func clearSessionDeadAlertLocked(e *entry) {
+	if e.sessionDeadAlert {
+		e.sessionDeadAlert = false
+		e.sessionDeadMsg = ""
+	}
+}
+
+// truncateAlert 折叠空白并截断告警信息（上游 401 页是整段 HTML）。
+func truncateAlert(s string) string {
+	const max = 200
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > max {
+		return s[:max] + "…"
+	}
+	return s
+}
+
 // Revive 解冻：清 disabled 与冷却。
 func (p *Pool) Revive(uid string) bool {
 	p.mu.Lock()
@@ -520,6 +594,8 @@ func (p *Pool) Revive(uid string) bool {
 	e.until = time.Time{}
 	e.reason = ""
 	e.errStreak = 0
+	// 解冻是全清：告警一并清除（人工确认可用）。
+	clearSessionDeadAlertLocked(e)
 	p.saveLocked()
 	return true
 }
@@ -570,6 +646,9 @@ func (p *Pool) NoteSuccess(uid string) {
 		// 「已过期的 until + 空 reason」这种半清理状态。
 		e.until = time.Time{}
 		e.reason = ""
+		// 对话成功 = token 确实有效 → 清失效告警，否则会出现
+		// 「账号在用、面板却提示需重新登录」的矛盾状态。
+		clearSessionDeadAlertLocked(e)
 	}
 }
 
@@ -866,6 +945,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Packs: e.packs, CheckedIn: p.todayCheckedInLocked(e), Note: note,
 		Cooling: !e.until.IsZero() && now.Before(e.until), Until: fmtTime(e.until), Reason: e.reason,
 		Disabled: e.disabled, Enabled: e.enabled, ExpiresAt: exp, SharedWith: shared,
+		SessionDeadAlert: e.sessionDeadAlert, SessionDeadMsg: e.sessionDeadMsg,
 		InFlight: e.inFlight, SuccessCount: e.successCount, ErrTotal: e.errTotal,
 		SuccessRate: rate, LastSuccess: fmtTime(e.lastSuccess),
 		LastErr: fmtTime(e.lastErr), LastErrMsg: e.lastErrMsg, TokensDelta: e.tokensDelta,

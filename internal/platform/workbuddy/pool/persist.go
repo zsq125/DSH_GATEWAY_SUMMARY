@@ -160,6 +160,8 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			tokenUsage:               s.TokenUsage,
 			softStreak:               s.SoftStreak,
 			sessionDeadFails:         s.SessionDeadFails,
+			sessionDeadAlert:         s.SessionDeadAlert,
+			sessionDeadMsg:           s.SessionDeadMsg,
 			consecutiveFails:         s.ConsecutiveFails,
 		}
 		// 到期快照按当前时刻惰性清洗：已过期、零剩余或超出总余额的脏数据不恢复。
@@ -299,6 +301,8 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			TokenUsage:               e.tokenUsage,
 			SoftStreak:               e.softStreak,
 			SessionDeadFails:         e.sessionDeadFails,
+			SessionDeadAlert:         e.sessionDeadAlert,
+			SessionDeadMsg:           e.sessionDeadMsg,
 			ConsecutiveFails:         e.consecutiveFails,
 			CreditsExpiring:          e.creditsExpiring,
 			CreditsEarliestExpiry:    e.creditsEarliestExpiry,
